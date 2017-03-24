@@ -19,7 +19,7 @@ Public domain.
 - `-colorized_image` – image to recolor;
 - `-output_image` – image to save result;
 - `-recolor_strength` – -N ... 0 ... 1 ... N, new palette strength, from original colors (0) to fully recolored (1);
-- `-color_function` – color transfer mode, currently present are: chol, pca, sym, mkl, rgb, xyz, lab, lms, hsl, hsl-polar, labrgb, cholMpca, cholMsym, exp1.
+- `-color_function` – color transfer mode, currently present are: chol, pca, sym/mkl, rgb, xyz, lab, lms, hsl, hsl-full, hsl-polar, hsl-polar-full, lab-rgb, chol-pca, chol-sym, exp1.
 
 **Experimental**, don't expect miracles from it.
 
@@ -27,4 +27,4 @@ Based on [Leon Gatys's](https://github.com/leongatys/NeuralImageSynthesis), [Pro
 
 **Example**:
 
-![Example of color transfer](https://github.com/VaKonS/colorizer/blob/master/sausage_cpsmccrxllhhle.jpg)
+![Example of color transfer](https://github.com/VaKonS/colorizer/blob/master/sausage_cpsmccrxllhhhhle.jpg)
