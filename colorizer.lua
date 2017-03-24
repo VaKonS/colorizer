@@ -15,7 +15,7 @@ cmd:option('-output_image', 'yummy.png',
 cmd:option('-recolor_strength', 1,
            'Color transfer strength:\n\t\t\t0 = original colors,\n\t\t\t1 = apply the palette at full strength,\n\t\t\t-x...0...1...y = space to experiment')
 cmd:option('-color_function', 'hsl-polar',
-           'Color matching function: chol, pca, sym / mkl, rgb, xyz, lab, lms, hsl, hsl-polar, labrgb, cholMpca, cholMsym, exp1')
+           'Color matching function: chol, pca, sym / mkl, rgb, xyz, lab, lms, hsl, hsl-full, hsl-polar, hsl-polar-full, lab-rgb, chol-pca, chol-sym, exp1')
 
 cmd:text()
 
@@ -310,8 +310,9 @@ function match_color(target_img, source_img, mode, eps)
     local s_hsl = image.rgb2hsl(source_img):view(source_img:size(1), source_img[1]:nElement())
     local t_hsl = image.rgb2hsl(target_img):view(target_img:size(1), target_img[1]:nElement())
 
-    local sMean, sVar = s_hsl:mean(2):squeeze(), torch.Tensor(3)
-    local tMean, tVar = t_hsl:mean(2):squeeze(), torch.Tensor(3)
+    local sMean, sVar, tMean, tVar = torch.Tensor(3), torch.Tensor(3), torch.Tensor(3), torch.Tensor(3)
+    sMean[2], sMean[3] = s_hsl[2]:mean(), s_hsl[3]:mean()
+    tMean[2], tMean[3] = t_hsl[2]:mean(), t_hsl[3]:mean()
     sVar[2], sVar[3] = torch.var(s_hsl[2], 1, true)[1] + eps, torch.var(s_hsl[3], 1, true)[1] + eps
     tVar[2], tVar[3] = torch.var(t_hsl[2], 1, true)[1] + eps, torch.var(t_hsl[3], 1, true)[1] + eps
 
