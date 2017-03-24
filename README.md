@@ -23,7 +23,7 @@ Public domain.
 
 **Experimental**, don't expect miracles from it.
 
-Based on [Leon Gatys's](https://github.com/leongatys/NeuralImageSynthesis), [ProGamerGov's](https://github.com/jcjohnson/neural-style/issues/376), [Adrian Rosebrock's](https://github.com/jrosebr1/color_transfer), [François Pitié's](https://github.com/frcs/colour-transfer), [mdfirman's](https://github.com/mdfirman/python_colour_transfer) code and different research papers (given in descriptions of functions).
+Based on [Leon Gatys's](https://github.com/leongatys/NeuralImageSynthesis), [ProGamerGov's](https://github.com/ProGamerGov/Neural-Tools), [Adrian Rosebrock's](https://github.com/jrosebr1/color_transfer), [François Pitié's](https://github.com/frcs/colour-transfer), [mdfirman's](https://github.com/mdfirman/python_colour_transfer) code and different research papers (given in descriptions of functions).
 
 **Example**:
 
