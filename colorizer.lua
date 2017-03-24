@@ -310,9 +310,10 @@ function match_color(target_img, source_img, mode, eps)
     local s_hsl = image.rgb2hsl(source_img):view(source_img:size(1), source_img[1]:nElement())
     local t_hsl = image.rgb2hsl(target_img):view(target_img:size(1), target_img[1]:nElement())
 
--- TODO: measure time waste for wrong hue mean/variance calculation
-    local sMean, sVar = s_hsl:mean(2):squeeze(), s_hsl:var(2, true):squeeze() + eps
-    local tMean, tVar = t_hsl:mean(2):squeeze(), t_hsl:var(2, true):squeeze() + eps
+    local sMean, sVar = s_hsl:mean(2):squeeze(), torch.Tensor(3)
+    local tMean, tVar = t_hsl:mean(2):squeeze(), torch.Tensor(3)
+    sVar[2], sVar[3] = torch.var(s_hsl[2], 1, true)[1] + eps, torch.var(s_hsl[3], 1, true)[1] + eps
+    tVar[2], tVar[3] = torch.var(t_hsl[2], 1, true)[1] + eps, torch.var(t_hsl[3], 1, true)[1] + eps
 
     -- Averaging hue in HSL makes significant wrong shift, taking mean hue from averaged RGB
     sMean[1] = image.rgb2hsl(torch.mean(source_img, 3):mean(2)):squeeze()[1]
@@ -338,22 +339,18 @@ function match_color(target_img, source_img, mode, eps)
     t_hsl[1] = hd1
 
     -- Hue variance
-    local HueDeltaVarPower = 2   -- 0 = off, 1 = mean(abs), 2 = variance, works like "histogram blurring"
-    sVar[1] = torch.abs(s_hsl[1]):pow(HueDeltaVarPower):mean() + eps
-    tVar[1] = torch.abs(t_hsl[1]):pow(HueDeltaVarPower):mean() + eps
+    sVar[1] = torch.abs(s_hsl[1]):pow(2):mean() + eps
+    tVar[1] = torch.abs(t_hsl[1]):pow(2):mean() + eps
 
-    -- Limited scaling
+    -- Soft limit
     local recolor_strength_lim = params.recolor_strength
     local recolor_strength_sign; if recolor_strength_lim < 0 then recolor_strength_sign = -1 else recolor_strength_sign = 1 end
     recolor_strength_lim = (math.abs(recolor_strength_lim) ^ (1/1.11)) * recolor_strength_sign
---    if recolor_strength_lim > 1 then recolor_strength_lim = 1 end
     -- Scaling hue, "ultraviolet" and "infrared" regions are cut off
-    -- variance^1/8 / lim
     t_hsl[1]:mul((sVar[1] / tVar[1]) ^ (params.recolor_strength / 8)):clamp(-0.5, 0.5):add(tMean[1] + (sMean[1] - tMean[1]) * recolor_strength_lim):remainder(1)
     -- Scaling saturation / lightness
-    -- standard deviation / lim
-    t_hsl[2]:add(-tMean[2]):mul((sVar[2] / tVar[2]) ^ params.recolor_strength / 2):add(tMean[2] + (sMean[2] - tMean[2]) * recolor_strength_lim)
-    -- variance^1/4 / lim
+--    if recolor_strength_lim > 1 then recolor_strength_lim = 1 end
+    t_hsl[2]:add(-tMean[2]):mul((sVar[2] / tVar[2]) ^  params.recolor_strength / 2 ):add(tMean[2] + (sMean[2] - tMean[2]) * recolor_strength_lim)
     t_hsl[3]:add(-tMean[3]):mul((sVar[3] / tVar[3]) ^ (params.recolor_strength / 4)):add(tMean[3] + (sMean[3] - tMean[3]) * recolor_strength_lim)
 
     return image.hsl2rgb(t_hsl:clamp(0, 1):viewAs(target_img)):clamp(0, 1)
@@ -362,38 +359,10 @@ function match_color(target_img, source_img, mode, eps)
     local s_hsl = image.rgb2hsl(source_img):view(source_img:size(1), source_img[1]:nElement())
     local t_hsl = image.rgb2hsl(target_img):view(target_img:size(1), target_img[1]:nElement())
 
--- TODO: measure time waste for wrong hue mean/variance calculation
-    local sMean, sVar = s_hsl:mean(2):squeeze(), s_hsl:var(2, true):squeeze() + eps
-    local tMean, tVar = t_hsl:mean(2):squeeze(), t_hsl:var(2, true):squeeze() + eps
-
-    -- Averaging hue in HSL makes significant wrong shift, taking mean hue from averaged RGB
---    local sMeanCorr = image.rgb2hsl(torch.mean(source_img, 3):mean(2)):squeeze()[1]
---    local tMeanCorr = image.rgb2hsl(torch.mean(target_img, 3):mean(2)):squeeze()[1]
-    -- Average hue, weighted by saturation
-    local sMeanCorr = torch.cmul(s_hsl[1], s_hsl[2]):sum() / torch.sum(s_hsl[2])
-    local tMeanCorr = torch.cmul(t_hsl[1], t_hsl[2]):sum() / torch.sum(t_hsl[2])
---print("")
---print("Mean:", sMean[1], tMean[1])
---print("Mean corrected:", sMeanCorr, tMeanCorr)
-
-    -- Simple replacement, corrects colors too much
-    --sMean[1] = sMeanCorr
-    --tMean[1] = tMeanCorr
--- --[[
-    -- Average(Corrected + HSL)
-    local MiddleHue = ((sMean[1] + sMeanCorr) / 2) % 1
-    local MiddleHueShifted = (((sMean[1] + 0.5) % 1 + (sMeanCorr + 0.5) % 1) / 2 + 0.5) % 1
-    if (math.abs(sMean[1] - MiddleHueShifted) < math.abs(sMean[1] - MiddleHue)) or
-       (math.abs(sMeanCorr - MiddleHueShifted) < math.abs(sMeanCorr - MiddleHue))
-       then MiddleHue = MiddleHueShifted end
-    sMean[1] = MiddleHue
-    MiddleHue = ((tMean[1] + tMeanCorr) / 2) % 1
-    MiddleHueShifted = (((tMean[1] + 0.5) % 1 + (tMeanCorr + 0.5) % 1) / 2 + 0.5) % 1
-    if (math.abs(tMean[1] - MiddleHueShifted) < math.abs(tMean[1] - MiddleHue)) or
-       (math.abs(tMeanCorr - MiddleHueShifted) < math.abs(tMeanCorr - MiddleHue))
-       then MiddleHue = MiddleHueShifted end
-    tMean[1] = MiddleHue
---]]
+    local sMean, sVar = s_hsl:mean(2):squeeze(), torch.Tensor(3)
+    local tMean, tVar = t_hsl:mean(2):squeeze(), torch.Tensor(3)
+    sVar[2], sVar[3] = torch.var(s_hsl[2], 1, true)[1] + eps, torch.var(s_hsl[3], 1, true)[1] + eps
+    tVar[2], tVar[3] = torch.var(t_hsl[2], 1, true)[1] + eps, torch.var(t_hsl[3], 1, true)[1] + eps
 
     -- Finding source hue deltas
     local hd1 = s_hsl[1] - sMean[1]
@@ -414,27 +383,23 @@ function match_color(target_img, source_img, mode, eps)
     hd1[hm] = hd3[hm]
     t_hsl[1] = hd1
 
-    -- Hue variance
-    local HueDeltaVarPower = 2   -- 0 = off, 1 = mean(abs), 2 = variance, works like "histogram blurring"
-    sVar[1] = torch.abs(s_hsl[1]):pow(HueDeltaVarPower):mean() + eps
-    tVar[1] = torch.abs(t_hsl[1]):pow(HueDeltaVarPower):mean() + eps
+    -- Hue variance, saturation-weighted
+    sVar[1] = torch.abs(torch.cmul(s_hsl[1], s_hsl[2])):pow(0.75):sum() / torch.sum(s_hsl[2]) + eps
+    tVar[1] = torch.abs(torch.cmul(t_hsl[1], t_hsl[2])):pow(0.75):sum() / torch.sum(t_hsl[2]) + eps
 
-    -- Limited scaling
+    -- Soft limit
     local recolor_strength_lim = params.recolor_strength
     local recolor_strength_sign; if recolor_strength_lim < 0 then recolor_strength_sign = -1 else recolor_strength_sign = 1 end
     recolor_strength_lim = (math.abs(recolor_strength_lim) ^ (1/1.11)) * recolor_strength_sign
---    if recolor_strength_lim > 1 then recolor_strength_lim = 1 end
     -- Scaling hue, "ultraviolet" and "infrared" regions are cut off
-    -- variance^1/8 / lim
-    t_hsl[1]:mul((sVar[1] / tVar[1]) ^ (params.recolor_strength / 8)):clamp(-0.5, 0.5):add(tMean[1] + (sMean[1] - tMean[1]) * recolor_strength_lim):remainder(1)
+    t_hsl[1]:mul((sVar[1] / tVar[1]) ^ (params.recolor_strength / 0.75)):clamp(-0.5, 0.5):add(tMean[1] + (sMean[1] - tMean[1]) * recolor_strength_lim):remainder(1)
     -- Scaling saturation / lightness
-    -- standard deviation / lim
-    t_hsl[2]:add(-tMean[2]):mul((sVar[2] / tVar[2]) ^ params.recolor_strength / 2):add(tMean[2] + (sMean[2] - tMean[2]) * recolor_strength_lim)
-    -- variance^1/4 / lim
+    -- if recolor_strength_lim > 1 then recolor_strength_lim = 1 end
+    t_hsl[2]:add(-tMean[2]):mul((sVar[2] / tVar[2]) ^  params.recolor_strength / 2 ):add(tMean[2] + (sMean[2] - tMean[2]) * recolor_strength_lim)
     t_hsl[3]:add(-tMean[3]):mul((sVar[3] / tVar[3]) ^ (params.recolor_strength / 4)):add(tMean[3] + (sMean[3] - tMean[3]) * recolor_strength_lim)
 
     return image.hsl2rgb(t_hsl:clamp(0, 1):viewAs(target_img)):clamp(0, 1)
-  elseif mode == 'labrgb' then
+  elseif mode == 'lab-rgb' then
      local s_lab = image.rgb2lab(source_img)  -- -100...100 range?
      local t_lab = image.rgb2lab(target_img)
      local sMean = torch.Tensor({torch.mean(s_lab[1]), torch.mean(s_lab[2]), torch.mean(s_lab[3])}):view(3,1,1)
@@ -517,7 +482,7 @@ function match_color(target_img, source_img, mode, eps)
     local QtCsQt = eve_QtCsQt * torch.diag(eva_QtCsQt):sqrt() * eve_QtCsQt:t()
     local iQt = torch.inverse(Qt)
     ts = iQt * QtCsQt * iQt
-  elseif mode == 'cholMpca' then
+  elseif mode == 'chol-pca' then
     local chol_s = torch.potrf(Cs, 'L')
     local chol_t = torch.potrf(Ct, 'L')
     local ts_chol = chol_s * torch.inverse(chol_t)
@@ -529,7 +494,7 @@ function match_color(target_img, source_img, mode, eps)
     local ts_pca = Qs * torch.inverse(Qt)
 
     ts = (ts_chol + ts_pca) / 2
-  elseif mode == 'cholMsym' then
+  elseif mode == 'chol-sym' then
     local chol_s = torch.potrf(Cs, 'L')
     local chol_t = torch.potrf(Ct, 'L')
     local ts_chol = chol_s * torch.inverse(chol_t)
