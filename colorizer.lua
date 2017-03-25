@@ -422,7 +422,7 @@ function match_color(target_img, source_img, mode, eps)
   end
 
   -- from Leon Gatys's code: https://github.com/leongatys/NeuralImageSynthesis/blob/master/ExampleNotebooks/ColourControl.ipynb
-  -- and ProGamerGov's code: https://github.com/jcjohnson/neural-style/issues/376
+  -- and ProGamerGov's code: https://github.com/jcjohnson/neural-style/issues/376, https://github.com/ProGamerGov/Neural-Tools
   local eyem = torch.eye(source_img:size(1)):mul(eps)
 
   local mu_s = torch.mean(source_img, 3):mean(2)
