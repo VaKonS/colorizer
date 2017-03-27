@@ -305,6 +305,60 @@ function match_color(target_img, source_img, mode, eps)
 
     tCol[1]:div(math.pi * 2)
     return image.hsl2rgb(tCol:clamp(0, 1):viewAs(target_img)):clamp(0, 1)
+  elseif mode == 'hsl-tint' then
+    -- Scaling in Cartesian coordinates, saturation is scaled together with hue
+    local s_hsl = image.rgb2hsl(source_img):view(source_img:size(1), source_img[1]:nElement())
+    local t_hsl = image.rgb2hsl(target_img):view(target_img:size(1), target_img[1]:nElement())
+
+    -- Hue-saturation vector projections
+    s_hsl[1]:mul(math.pi * 2)
+    t_hsl[1]:mul(math.pi * 2)
+    local s_cos = torch.cos(s_hsl[1]):cmul(s_hsl[2])
+    local t_cos = torch.cos(t_hsl[1]):cmul(t_hsl[2])
+    s_hsl[1]:sin():cmul(s_hsl[2])
+    t_hsl[1]:sin():cmul(t_hsl[2])
+    s_hsl[2] = s_cos
+    t_hsl[2] = t_cos
+
+    -- Scaling
+    local sMean, sStd = s_hsl:mean(2):squeeze(), torch.Tensor(3, 1)
+    local tMean, tStd = t_hsl:mean(2):squeeze(), torch.Tensor(3, 1)
+    sStd[1], sStd[2], sStd[3] = torch.var(s_hsl[1], 1, true), torch.var(s_hsl[2], 1, true), torch.std(s_hsl[3], 1, true)
+    tStd[1], tStd[2], tStd[3] = torch.var(t_hsl[1], 1, true), torch.var(t_hsl[2], 1, true), torch.std(t_hsl[3], 1, true)
+    local tCol = torch.Tensor(3, t_hsl:size(2))
+    tCol[1] = (t_hsl[1] - tMean[1]):mul((sStd[1][1] / tStd[1][1]) ^ 0.5):add(sMean[1])
+    tCol[2] = (t_hsl[2] - tMean[2]):mul((sStd[2][1] / tStd[2][1]) ^ 0.5):add(sMean[2])
+    tCol[3] = (t_hsl[3] - tMean[3]):mul( sStd[3][1] / tStd[3][1]):add(sMean[3])
+
+    -- Splitting hue and saturation back
+    local tSat = torch.pow(tCol[1], 2):add(torch.pow(tCol[2], 2)):sqrt()
+    tCol[1]:cdiv(tSat)
+    tCol[2]:cdiv(tSat)
+
+    -- Restoring hue angle
+    tCol[1]:clamp(-1, 1)
+    tCol[2]:clamp(-1, 1)
+    local sn = torch.lt(tCol[1], 0)
+    local cn = torch.lt(tCol[2], 0)
+    tCol[1]:asin()
+    tCol[2]:acos()
+    tCol[1][cn] = math.pi - tCol[1][cn]
+    tCol[2][sn] = -tCol[2][sn]
+    tCol[1]:remainder(math.pi * 2)
+    tCol[2]:remainder(math.pi * 2)
+
+    -- Averaging angles, restored from sine and cosine, to improve precision
+    local m180 = (math.pi - tCol[1]):abs():ge(math.pi / 2)             -- Rotated half mask
+    local tCol180 = torch.add(tCol[1], math.pi):remainder(math.pi * 2) -- Rotating by π to remove possible rounding errors at 0-360 point
+    local tRes180 = torch.add(tCol[2], math.pi):remainder(math.pi * 2)
+    tCol180:add(tRes180):div(2)
+    tCol[1]:add(tCol[2]):div(2)
+    tCol180:add(math.pi):remainder(math.pi * 2)  -- Rotating back
+    tCol[1][m180] = tCol180[m180]                -- and combining error-free halves
+
+    tCol[1]:div(math.pi * 2)
+    tCol[2] = tSat
+    return image.hsl2rgb(tCol:clamp(0, 1):viewAs(target_img)):clamp(0, 1)
   elseif mode == 'hsl-polar-full' then
     -- Hue scaling in polar coordinates
     local s_hsl = image.rgb2hsl(source_img):view(source_img:size(1), source_img[1]:nElement())
