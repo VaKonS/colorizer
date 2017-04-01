@@ -44,6 +44,209 @@ local function main(params)
 end
 
 
+-- --[[ -- Is it faster than next one?
+local function sort_arrays_xv(x, v)
+-- Sorting v and x tensors by order of x.
+  local x_sorted_i = {1}
+  for xi = 2, x:size(1) do
+    local xc = x[xi]
+    local xsi = 1
+    local xd = #x_sorted_i
+    while xd ~= 0 do
+      if xc > x[x_sorted_i[xsi] ] then
+        if xsi == #x_sorted_i then -- greater than last, insert after array
+          break
+        end
+        if xd < 0 then -- direction changed, reduce step
+          xd = math.ceil(-xd / 2)
+          if xd <= 0 then xd = 1 end
+        end
+        xsi = xsi + xd
+        if xsi > #x_sorted_i then xsi = #x_sorted_i end
+      elseif xc < x[x_sorted_i[xsi] ] then
+        if xsi == 1 then -- smaller than first, insert before array
+          xsi = 0
+          break
+        end
+        if xd > 0 then -- direction changed, reduce step
+          if xd == 1 then -- found position
+            xsi = xsi - 1
+            break
+          end
+          xd = -math.ceil(xd / 2)
+          if xd >= 0 then xd = -1 end
+        end
+        xsi = xsi + xd
+        if xsi < 1 then xsi = 1 end
+      else
+        break  -- duplicated x, replace
+      end
+    end
+    if (xsi > 0) and (x[xi] == x[x_sorted_i[xsi] ]) then
+      print("x["..xi.."] = x["..x_sorted_i[xsi].."], replacing v["..x_sorted_i[xsi].."].")
+      if v[xi] ~= v[x_sorted_i[xsi] ] then
+        print("Warning: different values v["..xi.."] and v["..x_sorted_i[xsi].."], relaced ("..v[x_sorted_i[xsi] ].." => "..v[xi]..")!")
+      end
+      x_sorted_i[xsi] = xi
+    else -- x[xi] > x[x_sorted_i[xsi] ]
+      table.insert (x_sorted_i, xsi + 1, xi)
+    end
+  end
+  local x1, v1 = torch.Tensor(#x_sorted_i), torch.Tensor(#x_sorted_i)
+  for xsi = 1, #x_sorted_i do
+    x1[xsi] = x[x_sorted_i[xsi] ]
+    v1[xsi] = v[x_sorted_i[xsi] ]
+  end
+  return x1, v1
+end
+--]]
+--[[ -- Is it slower than previous variant?
+local function sort_arrays_xv(x, v)
+-- Sorting v and x tensors by order of x.
+  local x_sorted_i = {1}
+  for xi = 2, x:size(1) do
+    local xc = x[xi]
+    local xsi = #x_sorted_i
+    if xc < x[x_sorted_i[1] ] then        -- smaller than first, insert before array
+      xsi = 0
+    elseif xc < x[x_sorted_i[xsi] ] then  -- within range, normal sorting
+      for i = 1, xsi do
+        if xc >= x[x_sorted_i[i] ] then
+          xsi = i
+          break
+        end
+      end
+    end
+    if (xsi > 0) and (x[xi] == x[x_sorted_i[xsi] ]) then
+      print("x["..xi.."] = x["..x_sorted_i[xsi].."], replacing v["..x_sorted_i[xsi].."].")
+      if v[xi] ~= v[x_sorted_i[xsi] ] then
+        print("Warning: different values v["..xi.."] and v["..x_sorted_i[xsi].."], relaced ("..v[x_sorted_i[xsi] ].." => "..v[xi]..")!")
+      end
+      x_sorted_i[xsi] = xi
+    else -- x[xi] > x[x_sorted_i[xsi] ]
+      table.insert (x_sorted_i, xsi + 1, xi)
+    end
+  end
+  local x1, v1 = torch.Tensor(#x_sorted_i), torch.Tensor(#x_sorted_i)
+  for xsi = 1, #x_sorted_i do
+    x1[xsi] = x[x_sorted_i[xsi] ]
+    v1[xsi] = v[x_sorted_i[xsi] ]
+  end
+  return x1, v1
+end
+--]]
+
+
+-- This particular implementation is why PDF transfer is so slow.
+local function lin_interp(x, v, xq)
+-- http://www.mathworks.com/help/matlab/ref/interp1.html
+-- https://github.com/torch/torch7/blob/master/doc/maths.md#res-torchlerpres-a-b-weight
+  x, v = sort_arrays_xv(x, v)
+  local vq = torch.Tensor(xq:size(1))
+  for xqi = 1, xq:size(1) do
+    if (x:size(1) == 1) then       -- only 1 point, nothing to extrapolate, assuming Xn = X1
+      vq[xqi] = v[1]
+    elseif (xq[xqi] <= x[1]) then  -- extrapolate below
+      vq[xqi] = v[1] - (x[1] - xq[xqi]) / (x[2] - x[1]) * (v[2] - v[1])
+    elseif (xq[xqi] >= x[-1]) then -- extrapolate above
+      vq[xqi] = v[-1] + (xq[xqi] - x[-1]) / (x[-1] - x[-2]) * (v[-1] - v[-2])
+    else                           -- interpolate
+      for xi = 2, x:size(1) do
+        if xq[xqi] <= x[xi] then
+          vq[xqi] = v[xi - 1] + (xq[xqi] - x[xi - 1]) / (x[xi] - x[xi - 1]) * (v[xi] - v[xi - 1])
+          break
+        end
+      end
+    end
+  end
+  return vq
+end
+
+
+-- Direct reimplementation in Torch of https://github.com/scipy/scipy/blob/master/scipy/linalg/decomp_svd.py#L214
+local function ml_orth(A)
+-- http://www.mathworks.com/help/matlab/ref/orth.html
+-- Construct an orthonormal basis for the range of A using SVD
+  local u, s, v = torch.svd(A, 'S')
+  local M, N = A:size(1), A:size(2)
+  local eps = 1e-10
+  local tol = math.max(M, N) * s:max() * eps
+  local num = torch.gt(s, tol):sum()
+  return u[{{}, {1, num}}]
+end
+
+
+-- Direct reimplementation in Torch of https://github.com/frcs/colour-transfer, (c) F. Pitie 2007.
+local function pdf_transfer1D(pX,pY)
+  local nbins =  pX:size(1)
+  local eps = 1e-6 -- small damping term that faciliates the inversion
+
+  local PX = torch.cumsum(pX + eps)
+  PX = torch.div(PX, PX[-1])
+
+  local PY = torch.cumsum(pY + eps)
+  PY = torch.div(PY, PY[-1])
+
+  -- inversion
+  local f = lin_interp(PY, torch.range(0, nbins-1), PX)
+  f[torch.le(PX, PY[1])] = 0
+  f[torch.ge(PX, PY[-1])] = nbins-1
+
+  for i = 1, f:size(1) do
+    local s = tostring(f[i])
+    if (s == "nan") or (s == "-nan") then print("pdf_transfer1D: NaN values have been generated.") end
+  end
+
+  return f
+end
+
+
+-- Direct reimplementation in Torch of https://github.com/frcs/colour-transfer, (c) F. Pitie 2007.
+local function pdf_transfer(D0, D1, Rotations, varargin)
+  local relaxation = varargin or 1.0  -- colorization level
+  local nb_iterations = Rotations:size(1)
+  local eps = 1e-10
+
+  local hist_points = 300   -- histogram precision, calculation time is proportional
+
+  for it = 1, nb_iterations do
+    print(string.format('IDT iteration %02d / %02d', it, nb_iterations))
+
+    local R = Rotations[it]
+    local nb_projs = R:size(1) -- 6
+
+    -- apply rotation
+    local D0R = R * D0
+    local D1R = R * D1
+    local D0R_ = torch.Tensor(D0R:size()):zero()
+
+    -- get the marginals, match them, and apply transformation
+    for i = 1, nb_projs do
+      print(string.format('Projection %d / %d', i, nb_projs))
+
+      -- get the data range
+      local datamin = math.min(D0R[i]:min(), D1R[i]:min()) - eps
+      local datamax = math.max(D0R[i]:max(), D1R[i]:max()) + eps
+      local u = torch.range(0, (hist_points - 1)) / (hist_points - 1) * (datamax - datamin) + datamin
+
+      -- get the projections
+      local p0R = torch.histc(D0R[i], hist_points, datamin, datamax)
+      local p1R = torch.histc(D1R[i], hist_points, datamin, datamax)
+
+      -- get the transport map
+      local f = pdf_transfer1D(p0R, p1R)
+
+      -- apply the mapping
+      D0R_[i] = (lin_interp(u, f, D0R[i])-1) / (hist_points - 1) * (datamax-datamin) + datamin
+    end
+
+    D0:add(torch.inverse(R):t() * (D0R_ - D0R) * relaxation)  -- D0 = relaxation * (R \ (D0R_ - D0R)) + D0;
+  end
+
+  return D0
+end
+
+
 function match_color(target_img, source_img, mode, eps)
   -- Matches the colour distribution of the target image to that of the source image
   -- using a linear transform.
@@ -455,24 +658,48 @@ function match_color(target_img, source_img, mode, eps)
 
     return image.hsl2rgb(t_hsl:clamp(0, 1):viewAs(target_img)):clamp(0, 1)
   elseif mode == 'lab-rgb' then
-     local s_lab = image.rgb2lab(source_img)  -- -100...100 range?
-     local t_lab = image.rgb2lab(target_img)
-     local sMean = torch.Tensor({torch.mean(s_lab[1]), torch.mean(s_lab[2]), torch.mean(s_lab[3])}):view(3,1,1)
-     local sStd = torch.Tensor( {torch.std( s_lab[1]), torch.std( s_lab[2]), torch.std( s_lab[3])}):view(3,1,1)
-     local tMean = torch.Tensor({torch.mean(t_lab[1]), torch.mean(t_lab[2]), torch.mean(t_lab[3])}):view(3,1,1)
-     local tStd = torch.Tensor( {torch.std( t_lab[1]), torch.std( t_lab[2]), torch.std( t_lab[3])}):view(3,1,1)
-     local tCol = t_lab - tMean:expandAs(t_lab)
-     tCol = tCol:cmul(sStd:expandAs(tCol)):cdiv(tStd:expandAs(tCol)) + sMean:expandAs(tCol)
-     tCol_lab = image.lab2rgb(tCol)
-     sMean = torch.Tensor({torch.mean(source_img[1]), torch.mean(source_img[2]), torch.mean(source_img[3])}):view(3,1,1)
-     sStd = torch.Tensor( {torch.std( source_img[1]), torch.std( source_img[2]), torch.std( source_img[3])}):view(3,1,1)
-     tMean = torch.Tensor({torch.mean(target_img[1]), torch.mean(target_img[2]), torch.mean(target_img[3])}):view(3,1,1)
-     tStd = torch.Tensor( {torch.std( target_img[1]), torch.std( target_img[2]), torch.std( target_img[3])}):view(3,1,1)
-     tCol = target_img - tMean:expandAs(target_img)
-     tCol = tCol:cmul(sStd:expandAs(tCol)):cdiv(tStd:expandAs(tCol)) + sMean:expandAs(tCol)
+    local s_lab = image.rgb2lab(source_img)  -- -100...100 range?
+    local t_lab = image.rgb2lab(target_img)
+    local sMean = torch.Tensor({torch.mean(s_lab[1]), torch.mean(s_lab[2]), torch.mean(s_lab[3])}):view(3,1,1)
+    local sStd = torch.Tensor( {torch.std( s_lab[1]), torch.std( s_lab[2]), torch.std( s_lab[3])}):view(3,1,1)
+    local tMean = torch.Tensor({torch.mean(t_lab[1]), torch.mean(t_lab[2]), torch.mean(t_lab[3])}):view(3,1,1)
+    local tStd = torch.Tensor( {torch.std( t_lab[1]), torch.std( t_lab[2]), torch.std( t_lab[3])}):view(3,1,1)
+    local tCol = t_lab - tMean:expandAs(t_lab)
+    tCol = tCol:cmul(sStd:expandAs(tCol)):cdiv(tStd:expandAs(tCol)) + sMean:expandAs(tCol)
+    tCol_lab = image.lab2rgb(tCol)
+    sMean = torch.Tensor({torch.mean(source_img[1]), torch.mean(source_img[2]), torch.mean(source_img[3])}):view(3,1,1)
+    sStd = torch.Tensor( {torch.std( source_img[1]), torch.std( source_img[2]), torch.std( source_img[3])}):view(3,1,1)
+    tMean = torch.Tensor({torch.mean(target_img[1]), torch.mean(target_img[2]), torch.mean(target_img[3])}):view(3,1,1)
+    tStd = torch.Tensor( {torch.std( target_img[1]), torch.std( target_img[2]), torch.std( target_img[3])}):view(3,1,1)
+    tCol = target_img - tMean:expandAs(target_img)
+    tCol = tCol:cmul(sStd:expandAs(tCol)):cdiv(tStd:expandAs(tCol)) + sMean:expandAs(tCol)
 
-     --return ((tCol_lab + tCol) / 2):clamp(0, 1)
-     return torch.cmul(tCol_lab, tCol):sqrt():cmul(tCol):sqrt():clamp(0, 1)
+    --return ((tCol_lab + tCol) / 2):clamp(0, 1)
+    return torch.cmul(tCol_lab, tCol):sqrt():cmul(tCol):sqrt():clamp(0, 1)
+  elseif mode == 'idt' then
+    -- Direct reimplementation in Torch of https://github.com/frcs/colour-transfer, (c) F. Pitie 2007.
+    -- Modified (can Torch divide 2 nonsquare matrices?), but seems to work.
+
+    local nb_iterations = 10 -- calculation time is proportional
+
+    local D0 = target_img:view(target_img:size(1), target_img[1]:nElement())
+    local D1 = source_img:view(source_img:size(1), source_img[1]:nElement())
+
+    print('Building a sequence of (almost) random projections.')
+    local R = torch.Tensor(nb_iterations, 3, 3)
+    R[1] = torch.Tensor({{ 1.0,  0.0,  0.0},
+                         { 0.0,  1.0,  0.0},
+                         { 0.0,  0.0,  1.0}})
+--  Temporarily removed.
+--  R[2] = torch.Tensor({{ 2/3,  2/3, -1/3},
+--                       { 2/3, -1/3,  2/3},
+--                       {-1/3,  2/3,  2/3}})
+    for i = 2, nb_iterations do
+      R[i]   = R[1] * ml_orth(torch.rand(3, 3))
+    end
+
+    print('Probability density function transfer.')
+    return pdf_transfer(D0, D1, R, 1):viewAs(target_img)
   end
 
   -- from Leon Gatys's code: https://github.com/leongatys/NeuralImageSynthesis/blob/master/ExampleNotebooks/ColourControl.ipynb
@@ -527,8 +754,6 @@ function match_color(target_img, source_img, mode, eps)
     local Dc = torch.diag((Dc2 + eps):sqrt())
     local Da_inv = torch.inverse(Da)
     ts = Ua * Da_inv * Uc * Dc * Uc:t() * Da_inv * Ua:t()
-  -- elseif mode == 'idt' then
-    -- https://github.com/frcs/colour-transfer
   elseif mode == 'sym' then
     local eva_t, eve_t = torch.symeig(Ct, 'V', 'L')
     local Qt = eve_t * torch.diag(eva_t):sqrt() * eve_t:t()
