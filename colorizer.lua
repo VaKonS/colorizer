@@ -247,6 +247,45 @@ local function pdf_transfer(D0, D1, Rotations, varargin)
 end
 
 
+local function reshape_histogram(channel_s, channel_d, hist_points)
+-- Scales destination histogram by shape of source histogram.
+-- Inspired by https://github.com/frcs/colour-transfer
+  local eps = 1e-10
+
+  -- Making histograms
+  local range_min_s, range_max_s = channel_s:min(), channel_s:max()   -- source range
+  local hist_points_s = torch.range(0, (hist_points - 1)) / (hist_points - 1) * (range_max_s - range_min_s) + range_min_s
+  local hist_s = torch.histc(channel_s, hist_points, range_min_s, range_max_s)   -- number of values within points' ranges
+
+  local range_min_d, range_max_d = channel_d:min(), channel_d:max()
+  local hist_points_d = torch.range(0, (hist_points - 1)) / (hist_points - 1) * (range_max_d - range_min_d) + range_min_d
+  local hist_d = torch.histc(channel_d, hist_points, range_min_d, range_max_d)
+
+  -- Normalizing histograms
+  local hist_s_n = (hist_s + eps):div(hist_s:max() + eps)
+  local hist_d_n = (hist_d + eps):div(hist_d:max() + eps)
+
+  -- Reshaping histogram
+  local hist_r = torch.cdiv(hist_d_n + eps, hist_s_n + eps)
+
+  -- Normalizing scaling factor, more relaxed for smaller histograms
+  hist_r:log()
+  local hist_r_n = torch.abs(hist_r):max() / hist_points + eps
+  hist_r:add(eps):div(hist_r_n)
+
+  -- Weighting scaling coefficients with new histogram
+  local shape_r = lin_interp(hist_points_d, hist_r, channel_d)
+
+  -- Scaling image channel
+  local mean_c_s, mean_c_d = channel_s:mean(), channel_d:mean()
+  local std_c_s, std_c_d = channel_s:std(), channel_d:std()
+  local scale_r = torch.Tensor(channel_d:size()):fill(std_c_s / std_c_d):cpow(shape_r)
+  local channel_r = (channel_d - mean_c_d):cmul(scale_r):add(mean_c_s)
+
+  return channel_r
+end
+
+
 function match_color(target_img, source_img, mode, eps)
   -- Matches the colour distribution of the target image to that of the source image
   -- using a linear transform.
@@ -678,7 +717,7 @@ function match_color(target_img, source_img, mode, eps)
     return torch.cmul(tCol_lab, tCol):sqrt():cmul(tCol):sqrt():clamp(0, 1)
   elseif mode == 'idt' then
     -- Direct reimplementation in Torch of https://github.com/frcs/colour-transfer, (c) F. Pitie 2007.
-    -- Modified (can Torch divide 2 nonsquare matrices?), but seems to work.
+    -- Modified (can Torch divide 2 non-square matrices?), but seems to work.
 
     local nb_iterations = 10 -- calculation time is proportional
 
@@ -699,7 +738,47 @@ function match_color(target_img, source_img, mode, eps)
     end
 
     print('Probability density function transfer.')
-    return pdf_transfer(D0, D1, R, 1):viewAs(target_img)
+    return pdf_transfer(D0, D1, R, params.recolor_strength):viewAs(target_img)
+  elseif mode == 'rgb-hist' then
+    -- Weighted by histogram scaling of RGB channels.
+    -- Inspired by https://github.com/frcs/colour-transfer
+
+    local iterations = 3   -- More iterations coloring harder, but computation time is almost squared.
+
+    print(string.format('Histogram-weighted RGB color transfer.'))
+    local eps = 1e-10
+    local ch_s = source_img:size(1)
+    local lin_s, lin_d = source_img:view(ch_s, source_img[1]:nElement()), target_img:view(ch_s, target_img[1]:nElement())
+
+    -- Initialazing with image, scaled by standard deviation.
+    local mean_s, mean_d = lin_s:mean(2):view(ch_s,1,1), lin_d:mean(2):view(ch_s,1,1)
+    local std_s, std_d   = lin_s:std(2),  lin_d:std(2)
+    local dr = (target_img - mean_d:expandAs(target_img)):cmul(torch.cdiv(std_s, std_d):view(ch_s,1,1):expandAs(target_img)):add(mean_s:expandAs(target_img))
+    --local dr = torch.Tensor(target_img:size()):zero()
+
+    for hist_points = 1, iterations do
+      print(string.format('Iteration %d / %d', hist_points, iterations))
+      local lin_r = torch.Tensor(lin_d:size())
+      for chan_i = 1, ch_s do
+        --print(string.format('Channel %d / %d', chan_i, ch_s))
+        lin_r[chan_i] = reshape_histogram(lin_s[chan_i], lin_d[chan_i], hist_points * 3)
+      end
+
+      -- 1) normal sum, faster, must be zero at start, only final result is valid
+      --dr:add(lin_r:viewAs(target_img):div(iterations))
+      -- 2) normal sum, every iteration is valid, initial state does not matter
+      --dr:mul((hist_points - 1) / hist_points):add(lin_r:viewAs(target_img):div(hist_points))
+      -- 3) fading sum, must be initialized with std at start
+      --dr:add(lin_r:viewAs(target_img):div(hist_points)):div((hist_points + 1) / hist_points)
+      -- 4) fading sum, x^(1/x...x/x), rasing smoothness
+      --local add_part = hist_points ^ (1 / (hist_points ^ (1 / (hist_points + 2))))
+      --dr:add(lin_r:viewAs(target_img):div(add_part)):div((add_part + 1) / add_part)
+      -- 5) fading sum, x^(1/x...x^2), exponential smoothness                                                                -- v Raise for smoother colors.
+      local add_part = hist_points ^ (( (hist_points ^ (1 - (2 / hist_points))) / (hist_points ^ ((4 / hist_points) - 1)) ) ^ (1/3) / 2)
+      dr:add(lin_r:viewAs(target_img):div(add_part)):div((add_part + 1) / add_part)
+    end
+
+    return dr:clamp(0, 1)
   end
 
   -- from Leon Gatys's code: https://github.com/leongatys/NeuralImageSynthesis/blob/master/ExampleNotebooks/ColourControl.ipynb
