@@ -44,118 +44,31 @@ local function main(params)
 end
 
 
--- --[[ -- Is it faster than next one?
-local function sort_arrays_xv(x, v)
--- Sorting v and x tensors by order of x.
-  local x_sorted_i = {1}
-  for xi = 2, x:size(1) do
-    local xc = x[xi]
-    local xsi = 1
-    local xd = #x_sorted_i
-    while xd ~= 0 do
-      if xc > x[x_sorted_i[xsi] ] then
-        if xsi == #x_sorted_i then -- greater than last, insert after array
-          break
-        end
-        if xd < 0 then -- direction changed, reduce step
-          xd = math.ceil(-xd / 2)
-          if xd <= 0 then xd = 1 end
-        end
-        xsi = xsi + xd
-        if xsi > #x_sorted_i then xsi = #x_sorted_i end
-      elseif xc < x[x_sorted_i[xsi] ] then
-        if xsi == 1 then -- smaller than first, insert before array
-          xsi = 0
-          break
-        end
-        if xd > 0 then -- direction changed, reduce step
-          if xd == 1 then -- found position
-            xsi = xsi - 1
-            break
-          end
-          xd = -math.ceil(xd / 2)
-          if xd >= 0 then xd = -1 end
-        end
-        xsi = xsi + xd
-        if xsi < 1 then xsi = 1 end
-      else
-        break  -- duplicated x, replace
-      end
-    end
-    if (xsi > 0) and (x[xi] == x[x_sorted_i[xsi] ]) then
-      print("x["..xi.."] = x["..x_sorted_i[xsi].."], replacing v["..x_sorted_i[xsi].."].")
-      if v[xi] ~= v[x_sorted_i[xsi] ] then
-        print("Warning: different values v["..xi.."] and v["..x_sorted_i[xsi].."], relaced ("..v[x_sorted_i[xsi] ].." => "..v[xi]..")!")
-      end
-      x_sorted_i[xsi] = xi
-    else -- x[xi] > x[x_sorted_i[xsi] ]
-      table.insert (x_sorted_i, xsi + 1, xi)
-    end
-  end
-  local x1, v1 = torch.Tensor(#x_sorted_i), torch.Tensor(#x_sorted_i)
-  for xsi = 1, #x_sorted_i do
-    x1[xsi] = x[x_sorted_i[xsi] ]
-    v1[xsi] = v[x_sorted_i[xsi] ]
-  end
-  return x1, v1
-end
---]]
---[[ -- Is it slower than previous variant?
-local function sort_arrays_xv(x, v)
--- Sorting v and x tensors by order of x.
-  local x_sorted_i = {1}
-  for xi = 2, x:size(1) do
-    local xc = x[xi]
-    local xsi = #x_sorted_i
-    if xc < x[x_sorted_i[1] ] then        -- smaller than first, insert before array
-      xsi = 0
-    elseif xc < x[x_sorted_i[xsi] ] then  -- within range, normal sorting
-      for i = 1, xsi do
-        if xc >= x[x_sorted_i[i] ] then
-          xsi = i
-          break
-        end
-      end
-    end
-    if (xsi > 0) and (x[xi] == x[x_sorted_i[xsi] ]) then
-      print("x["..xi.."] = x["..x_sorted_i[xsi].."], replacing v["..x_sorted_i[xsi].."].")
-      if v[xi] ~= v[x_sorted_i[xsi] ] then
-        print("Warning: different values v["..xi.."] and v["..x_sorted_i[xsi].."], relaced ("..v[x_sorted_i[xsi] ].." => "..v[xi]..")!")
-      end
-      x_sorted_i[xsi] = xi
-    else -- x[xi] > x[x_sorted_i[xsi] ]
-      table.insert (x_sorted_i, xsi + 1, xi)
-    end
-  end
-  local x1, v1 = torch.Tensor(#x_sorted_i), torch.Tensor(#x_sorted_i)
-  for xsi = 1, #x_sorted_i do
-    x1[xsi] = x[x_sorted_i[xsi] ]
-    v1[xsi] = v[x_sorted_i[xsi] ]
-  end
-  return x1, v1
-end
---]]
-
-
 -- This particular implementation is why PDF transfer is so slow.
 local function lin_interp(x, v, xq)
 -- http://www.mathworks.com/help/matlab/ref/interp1.html
--- https://github.com/torch/torch7/blob/master/doc/maths.md#res-torchlerpres-a-b-weight
-  x, v = sort_arrays_xv(x, v)
-  local vq = torch.Tensor(xq:size(1))
-  for xqi = 1, xq:size(1) do
-    if (x:size(1) == 1) then       -- only 1 point, nothing to extrapolate, assuming Xn = X1
-      vq[xqi] = v[1]
-    elseif (xq[xqi] <= x[1]) then  -- extrapolate below
-      vq[xqi] = v[1] - (x[1] - xq[xqi]) / (x[2] - x[1]) * (v[2] - v[1])
-    elseif (xq[xqi] >= x[-1]) then -- extrapolate above
-      vq[xqi] = v[-1] + (xq[xqi] - x[-1]) / (x[-1] - x[-2]) * (v[-1] - v[-2])
-    else                           -- interpolate
-      for xi = 2, x:size(1) do
-        if xq[xqi] <= x[xi] then
-          vq[xqi] = v[xi - 1] + (xq[xqi] - x[xi - 1]) / (x[xi] - x[xi - 1]) * (v[xi] - v[xi - 1])
-          break
-        end
+  local xs1, xqs1 = x:size(1), xq:size(1)
+  local vq = torch.Tensor(xqs1)
+  if xs1 == 1 then -- only 1 point, nothing to extrapolate, assuming Xn = X1
+    vq:fill(v[1])
+  else
+    local s, a = torch.Tensor(xs1), torch.Tensor(xs1)
+    s[{{1, -2}}] = torch.cdiv(v[{{2, -1}}] - v[{{1, -2}}], x[{{2, -1}}] - x[{{1, -2}}])
+    a[{{1, -2}}] = torch.addcmul(v[{{1, -2}}], -x[{{1, -2}}], s[{{1, -2}}])
+
+    local x1, xL, s1, sL, a1, x_min = x[1], x[-1], s[1], s[-2], a[1], x:min()
+    local aL = v[-1] - xL * sL
+    local xi = (xq - x_min):div((x:max() - x_min) / (xs1 - 1)):floor():long():add(1)
+
+    for xqi = 1, xqs1 do
+      local c = xq[xqi]
+      if c <= x1 then     -- extrapolate below
+        vq[xqi] = c * s1 + a1
+      elseif c >= xL then -- extrapolate above
+        vq[xqi] = c * sL + aL
+      else                -- interpolate
+        local i = xi[xqi]
+        vq[xqi] = c * s[i] + a[i]
       end
     end
   end
