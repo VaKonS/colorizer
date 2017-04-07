@@ -23,6 +23,7 @@ local params = cmd:parse(arg)
 
 
 local function main(params)
+  print(params.palette_image, "=>", params.colorized_image)
   local content_img = image.load(params.palette_image, 3)
   local style_img = image.load(params.colorized_image, 3)
 
@@ -44,21 +45,84 @@ local function main(params)
 end
 
 
--- This particular implementation is why PDF transfer is so slow.
+local function haveNaNs(t)  -- Checks that tensor contains NaN values.
+--[[
+  for i = 1, t:size(1) do
+    if math.abs(t[i]) > 0 then
+    else
+      return true
+    end
+  end
+  return false
+--]]
+  return not torch.abs(t):ge(0):all()
+end
+
+
+-- NaNs are zeroed in resulting tensor.
 local function lin_interp(x, v, xq)
 -- http://www.mathworks.com/help/matlab/ref/interp1.html
-  local xs1, xqs1 = x:size(1), xq:size(1)
-  local vq = torch.Tensor(xqs1)
-  if xs1 == 1 then -- only 1 point, nothing to extrapolate, assuming Xn = X1
-    vq:fill(v[1])
+  if x:size(1) == 1 then  -- only 1 point, xq = xq/x*v
+    return torch.mul(xq, v[1]):div(x[1])
   else
-    local s, a = torch.Tensor(xs1), torch.Tensor(xs1)
+    -- Removing NaNs
+    local x_is_number = torch.abs(x):ge(0)
+    local x, xnc = torch.sort(x[x_is_number])
+    local v = v[x_is_number]:index(1, xnc)
+
+    local xs1, xqs1 = x:size(1), xq:size(1)
+    local vq = torch.zeros(xqs1)  -- to not generate NaNs accidentally.
+    local s = torch.cdiv(v[{{2, -1}}] - v[{{1, -2}}], x[{{2, -1}}] - x[{{1, -2}}])
+    local a = torch.addcmul(v[{{1, -2}}], -x[{{1, -2}}], s)
+    local x1, xL, s1, sL, x_min = x[1], x[-1], s[1], s[-1], x:min()
+    local a1, aL, x_avg = a[1], v[-1] - xL * sL, (x:max() - x_min) / 2
+
+    for xqi = 1, xqs1 do
+      local c = xq[xqi]
+      if c <= x1 then              -- extrapolate below
+        vq[xqi] = c * s1 + a1
+      elseif c >= xL then          -- extrapolate above
+        vq[xqi] = c * sL + aL
+      elseif math.abs(c) >= 0 then -- interpolate, NaNs are ignored
+        if c < x_avg then
+          for i = 2, xs1 do
+            if c < x[i] then
+              i = i - 1
+              vq[xqi] = c * s[i] + a[i]
+              break
+            end
+          end
+        else
+          for i = xs1, 2, -1 do
+            if c >= x[i] then
+              vq[xqi] = c * s[i] + a[i]
+              break
+            end
+          end
+        end
+      end
+    end
+    return vq
+  end
+end
+
+
+-- Faster variant for tensors without NaNs.
+local function lin_interp_r(x, v, xq)
+-- http://www.mathworks.com/help/matlab/ref/interp1.html
+  local xs1 = x:size(1)
+  if xs1 == 1 then  -- only 1 point, xq = xq/x*v
+    return torch.mul(xq, v[1]):div(x[1])
+  else
+    local xqs1 = xq:size(1)
+    local s, a, vq = torch.Tensor(xs1), torch.Tensor(xs1), torch.Tensor(xqs1)
     s[{{1, -2}}] = torch.cdiv(v[{{2, -1}}] - v[{{1, -2}}], x[{{2, -1}}] - x[{{1, -2}}])
     a[{{1, -2}}] = torch.addcmul(v[{{1, -2}}], -x[{{1, -2}}], s[{{1, -2}}])
 
-    local x1, xL, s1, sL, a1, x_min = x[1], x[-1], s[1], s[-2], a[1], x:min()
-    local aL = v[-1] - xL * sL
+    local x1, xL, s1, sL, x_min = x[1], x[-1], s[1], s[-2], x:min()
+    local a1, aL = a[1], v[-1] - xL * sL
     local xi = (xq - x_min):div((x:max() - x_min) / (xs1 - 1)):floor():long():add(1)
+    s[-1], a[-1] = sL, aL  -- [-1] should not be used, but precision errors can make xi[]=[-1]
 
     for xqi = 1, xqs1 do
       local c = xq[xqi]
@@ -71,8 +135,8 @@ local function lin_interp(x, v, xq)
         vq[xqi] = c * s[i] + a[i]
       end
     end
+    return vq
   end
-  return vq
 end
 
 
@@ -105,10 +169,8 @@ local function pdf_transfer1D(pX,pY)
   f[torch.le(PX, PY[1])] = 0
   f[torch.ge(PX, PY[-1])] = nbins-1
 
-  for i = 1, f:size(1) do
-    local s = tostring(f[i])
-    if (s == "nan") or (s == "-nan") then print("pdf_transfer1D: NaN values have been generated.") end
-  end
+  -- Currently, lin_interp zeroes NaNs, therefore this message is useless.
+  --if haveNaNs(f) then print("pdf_transfer1D: NaN values have been generated.") end
 
   return f
 end
@@ -187,7 +249,7 @@ local function reshape_histogram(channel_s, channel_d, hist_points)
   hist_r:add(eps):div(hist_r_n)
 
   -- Weighting scaling coefficients with new histogram
-  local shape_r = lin_interp(hist_points_d, hist_r, channel_d)
+  local shape_r = lin_interp_r(hist_points_d, hist_r, channel_d)
 
   -- Scaling image channel
   local mean_c_s, mean_c_d = channel_s:mean(), channel_d:mean()
