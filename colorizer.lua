@@ -20,6 +20,7 @@ cmd:option('-color_function', 'hsl-polar',
 cmd:text()
 
 local params = cmd:parse(arg)
+local Torch_MultiCore = torch.getnumcores() > 1
 
 
 local function main(params)
@@ -62,38 +63,46 @@ end
 -- NaNs are zeroed in resulting tensor.
 local function lin_interp(x, v, xq)
 -- http://www.mathworks.com/help/matlab/ref/interp1.html
-  if x:size(1) == 1 then  -- only 1 point, xq = xq/x*v
+  if x:size(1) == 1 then  -- only 1 point, vq = xq/x*v
     return torch.mul(xq, v[1]):div(x[1])
   else
-    -- Removing NaNs
+    -- Removing NaNs from X / V
     local x_is_number = torch.abs(x):ge(0)
     local x, xnc = torch.sort(x[x_is_number])
     local v = v[x_is_number]:index(1, xnc)
-
     local xs1, xqs1 = x:size(1), xq:size(1)
-    local vq = torch.zeros(xqs1)  -- to not generate NaNs accidentally.
-    local s = torch.cdiv(v[{{2, -1}}] - v[{{1, -2}}], x[{{2, -1}}] - x[{{1, -2}}])
-    local a = torch.addcmul(v[{{1, -2}}], -x[{{1, -2}}], s)
-    local x1, xL, s1, sL, x_min = x[1], x[-1], s[1], s[-1], x:min()
-    local a1, aL, x_avg = a[1], v[-1] - xL * sL, (x:max() - x_min) / 2
 
-    for xqi = 1, xqs1 do
-      local c = xq[xqi]
-      if c <= x1 then              -- extrapolate below
-        vq[xqi] = c * s1 + a1
-      elseif c >= xL then          -- extrapolate above
-        vq[xqi] = c * sL + aL
-      elseif math.abs(c) >= 0 then -- interpolate, NaNs are ignored
-        if c < x_avg then
-          for i = 2, xs1 do
-            if c < x[i] then
-              i = i - 1
-              vq[xqi] = c * s[i] + a[i]
-              break
-            end
-          end
-        else
-          for i = xs1, 2, -1 do
+    local s, a, vq = torch.Tensor(xs1), torch.Tensor(xs1), torch.zeros(xqs1) -- to not generate NaNs accidentally.
+    local x_min, x_max = x:min(), x:max()
+    local x_bin = (x_max - x_min) / (xs1 - 1)
+    s[{{1, -2}}] = (v[{{2, -1}}] - v[{{1, -2}}]):cdiv(x[{{2, -1}}] - x[{{1, -2}}])
+    a[{{1, -2}}] = torch.addcmul(v[{{1, -2}}], -x[{{1, -2}}], s[{{1, -2}}])
+    local s1, sL = s[1], s[-2]
+    local a1, aL = a[1], v[-1] - x_max * sL
+    s[-1], a[-1] = sL, aL  -- [-1] should not be used (x>=x_max handled separately), but rounding errors can result in [-1]
+
+    -- Finding maximum x values, less than equally spaced x[]
+    local x_search, fMin = torch.Tensor(xs1), 1
+    for i = 2, xs1 do
+      local fMax = math.min(math.floor((x[i] - x_min) / x_bin) + 1, xs1)
+      if fMax ~= fMin then
+        x_search[{{fMin, fMax - 1}}]:fill(i - 1)
+        fMin = fMax
+      end
+    end
+    x_search[{{fMin, -1}}]:fill(xs1)
+
+    if Torch_MultiCore then -- Torch parallel calculations should be faster in multicore environment.
+      local xi = (xq - x_min):div(x_bin):floor():long():add(1)  -- Equally-spaced index
+      local xq_numeric = torch.abs(xq):ge(0)  -- Numeric values flag
+      for xqi = 1, xqs1 do
+        local c = xq[xqi]
+        if c <= x_min then          -- extrapolate below
+          vq[xqi] = c * s1 + a1
+        elseif c >= x_max then      -- extrapolate above
+          vq[xqi] = c * sL + aL
+        elseif xq_numeric[xqi] then -- interpolate, NaNs are ignored
+          for i = x_search[xi[xqi]], 1, -1 do
             if c >= x[i] then
               vq[xqi] = c * s[i] + a[i]
               break
@@ -101,34 +110,52 @@ local function lin_interp(x, v, xq)
           end
         end
       end
-    end
+    else -- Lua variant should be faster on single core, because calculations are partially skipped, depending on images.
+      for xqi = 1, xqs1 do
+        local c = xq[xqi]
+        if c <= x_min then           -- extrapolate below
+          vq[xqi] = c * s1 + a1
+        elseif c >= x_max then       -- extrapolate above
+          vq[xqi] = c * sL + aL
+        elseif math.abs(c) >= 0 then -- interpolate, NaNs are ignored
+          for i = x_search[ math.floor((c - x_min) / x_bin) + 1 ], 1, -1 do
+            if c >= x[i] then
+              vq[xqi] = c * s[i] + a[i]
+              break
+            end
+          end
+        end
+      end
+    end   -- Single/MultiCore
     return vq
   end
 end
 
 
--- Faster variant for tensors without NaNs.
+-- Faster variant for tensors without NaNs and sorted and equally spaced X.
 local function lin_interp_r(x, v, xq)
 -- http://www.mathworks.com/help/matlab/ref/interp1.html
   local xs1 = x:size(1)
-  if xs1 == 1 then  -- only 1 point, xq = xq/x*v
+  if xs1 == 1 then  -- only 1 point, vq = xq/x*v
     return torch.mul(xq, v[1]):div(x[1])
   else
     local xqs1 = xq:size(1)
     local s, a, vq = torch.Tensor(xs1), torch.Tensor(xs1), torch.Tensor(xqs1)
-    s[{{1, -2}}] = torch.cdiv(v[{{2, -1}}] - v[{{1, -2}}], x[{{2, -1}}] - x[{{1, -2}}])
+    local x_min, x_max = x:min(), x:max()
+    local x_bin = (x_max - x_min) / (xs1 - 1)
+    s[{{1, -2}}] = (v[{{2, -1}}] - v[{{1, -2}}]):div(x_bin)
     a[{{1, -2}}] = torch.addcmul(v[{{1, -2}}], -x[{{1, -2}}], s[{{1, -2}}])
 
-    local x1, xL, s1, sL, x_min = x[1], x[-1], s[1], s[-2], x:min()
-    local a1, aL = a[1], v[-1] - xL * sL
-    local xi = (xq - x_min):div((x:max() - x_min) / (xs1 - 1)):floor():long():add(1)
-    s[-1], a[-1] = sL, aL  -- [-1] should not be used, but precision errors can make xi[]=[-1]
+    local s1, sL = s[1], s[-2]
+    local a1, aL = a[1], v[-1] - x_max * sL
+    s[-1], a[-1] = sL, aL
+    local xi = (xq - x_min):div(x_bin):floor():long():add(1)
 
     for xqi = 1, xqs1 do
       local c = xq[xqi]
-      if c <= x1 then     -- extrapolate below
+      if c <= x_min then     -- extrapolate below
         vq[xqi] = c * s1 + a1
-      elseif c >= xL then -- extrapolate above
+      elseif c >= x_max then -- extrapolate above
         vq[xqi] = c * sL + aL
       else                -- interpolate
         local i = xi[xqi]
