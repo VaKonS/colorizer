@@ -15,12 +15,14 @@ cmd:option('-output_image', 'yummy.png',
 cmd:option('-recolor_strength', 1,
            'Color transfer strength:\n\t\t\t0 = original colors,\n\t\t\t1 = apply the palette at full strength,\n\t\t\t-x...0...1...y = space to experiment')
 cmd:option('-color_function', 'hsl-polar',
-           'Color matching function: chol, pca, sym / mkl, rgb, xyz, lab, lms, hsl, hsl-full, hsl-polar, hsl-polar-full, lab-rgb, chol-pca, chol-sym, exp1')
+           'Color matching function: chol, pca, sym / mkl, rgb, xyz, lab, lms, hsl, hsl-full, hsl-polar, hsl-polar-full, idt, idt-mean, rgb-hist, lab-rgb, chol-pca, chol-sym, exp1')
+cmd:option('-prefer_torch', false,
+           'Prefer Torch calculations on single core (can be faster on some machines).')
 
 cmd:text()
 
 local params = cmd:parse(arg)
-local Torch_MultiCore = torch.getnumcores() > 1
+local Torch_MultiCore = params.prefer_torch or torch.getnumcores() > 1
 
 
 local function main(params)
@@ -92,7 +94,7 @@ local function lin_interp(x, v, xq)
     end
     x_search[{{fMin, -1}}]:fill(xs1)
 
-    if Torch_MultiCore then -- Torch parallel calculations should be faster in multicore environment.
+    if Torch_MultiCore == true then -- Torch parallel calculations should be faster in multicore environment.
       local xi = (xq - x_min):div(x_bin):floor():long():add(1)  -- Equally-spaced index
       local xq_numeric = torch.abs(xq):ge(0)  -- Numeric values flag
       for xqi = 1, xqs1 do
@@ -150,7 +152,7 @@ local function lin_interp_r(x, v, xq)
     local a1, aL = a[1], v[-1] - x_max * sL
     s[-1], a[-1] = sL, aL
 
-    if Torch_MultiCore then -- Torch parallel calculations should be faster in multicore environment.
+    if Torch_MultiCore == true then -- Torch parallel calculations should be faster in multicore environment.
       local xi = (xq - x_min):div(x_bin):floor():long():add(1)
       for xqi = 1, xqs1 do
         local c = xq[xqi]
@@ -848,7 +850,7 @@ function match_color(target_img, source_img, mode, eps)
     -- Weighted by histogram scaling of RGB channels.
     -- Inspired by https://github.com/frcs/colour-transfer
 
-    local iterations = 3   -- More iterations coloring harder, but computation time is almost squared.
+    local iterations = 3   -- More iterations coloring harder, but computation time is almost squared times longer.
 
     print(string.format('Histogram-weighted RGB color transfer.'))
     local eps = 1e-10
