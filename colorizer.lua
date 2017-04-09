@@ -149,19 +149,33 @@ local function lin_interp_r(x, v, xq)
     local s1, sL = s[1], s[-2]
     local a1, aL = a[1], v[-1] - x_max * sL
     s[-1], a[-1] = sL, aL
-    local xi = (xq - x_min):div(x_bin):floor():long():add(1)
 
-    for xqi = 1, xqs1 do
-      local c = xq[xqi]
-      if c <= x_min then     -- extrapolate below
-        vq[xqi] = c * s1 + a1
-      elseif c >= x_max then -- extrapolate above
-        vq[xqi] = c * sL + aL
-      else                -- interpolate
-        local i = xi[xqi]
-        vq[xqi] = c * s[i] + a[i]
+    if Torch_MultiCore then -- Torch parallel calculations should be faster in multicore environment.
+      local xi = (xq - x_min):div(x_bin):floor():long():add(1)
+      for xqi = 1, xqs1 do
+        local c = xq[xqi]
+        if c <= x_min then     -- extrapolate below
+          vq[xqi] = c * s1 + a1
+        elseif c >= x_max then -- extrapolate above
+          vq[xqi] = c * sL + aL
+        else                   -- interpolate
+          local i = xi[xqi]
+          vq[xqi] = c * s[i] + a[i]
+        end
       end
-    end
+    else -- Lua variant should be faster on single core, because calculations are partially skipped, depending on images.
+      for xqi = 1, xqs1 do
+        local c = xq[xqi]
+        if c <= x_min then     -- extrapolate below
+          vq[xqi] = c * s1 + a1
+        elseif c >= x_max then -- extrapolate above
+          vq[xqi] = c * sL + aL
+        else                   -- interpolate
+          local i = math.floor((c - x_min) / x_bin) + 1
+          vq[xqi] = c * s[i] + a[i]
+        end
+      end
+    end   -- Single/MultiCore
     return vq
   end
 end
@@ -229,7 +243,7 @@ local function pdf_transfer(D0, D1, Rotations, varargin)
       -- get the data range
       local datamin = math.min(D0R[i]:min(), D1R[i]:min()) - eps
       local datamax = math.max(D0R[i]:max(), D1R[i]:max()) + eps
-      local u = torch.range(0, (hist_points - 1)) / (hist_points - 1) * (datamax - datamin) + datamin
+      local u = torch.linspace(datamin, datamax, hist_points)
 
       -- get the projections
       local p0R = torch.histc(D0R[i], hist_points, datamin, datamax)
@@ -249,6 +263,75 @@ local function pdf_transfer(D0, D1, Rotations, varargin)
 end
 
 
+-- Direct reimplementation in Torch of https://github.com/frcs/colour-transfer, (c) F. Pitie 2007.
+local function pdf_transfer1D_mean_weighted(pX,pY)
+-- With mean-weigthed linear interpolation
+  local nbins = pX:size(1)
+  local eps = 1e-6 -- small damping term that faciliates the inversion
+
+  local PX = torch.cumsum(pX + eps)
+  PX = torch.div(PX, PX[-1])
+
+  local PY = torch.cumsum(pY + eps)
+  PY = torch.div(PY, PY[-1])
+
+  -- inversion
+  local f = lin_interp_r(PY, torch.range(0, nbins - 1), PX)
+  f[torch.le(PX, PY[1])] = 0
+  f[torch.ge(PX, PY[-1])] = nbins - 1
+
+  -- Currently, lin_interp zeroes NaNs, therefore this message is useless.
+  --if haveNaNs(f) then print("pdf_transfer1D: NaN values have been generated.") end
+
+  return f
+end
+
+
+-- Direct reimplementation in Torch of https://github.com/frcs/colour-transfer, (c) F. Pitie 2007.
+local function pdf_transfer_mean_weighted(D0, D1, R, nb_iterations, varargin)
+-- With mean-weigthed linear interpolation
+  local relaxation = varargin or 1.0  -- colorization level
+  local eps = 1e-10
+
+  local hist_points = 300   -- histogram precision, calculation time is proportional
+
+  for it = 1, nb_iterations do
+    print(string.format('IDT iteration %02d / %02d', it, nb_iterations))
+
+    local nb_projs = R:size(1) -- 6
+
+    -- apply rotation
+    local D0R = R * D0
+    local D1R = R * D1
+    local D0R_ = torch.Tensor(D0R:size()):zero()
+
+    -- get the marginals, match them, and apply transformation
+    for i = 1, nb_projs do
+      print(string.format('Projection %d / %d', i, nb_projs))
+
+      -- get the data range
+      local datamin = math.min(D0R[i]:min(), D1R[i]:min()) - eps
+      local datamax = math.max(D0R[i]:max(), D1R[i]:max()) + eps
+      local u = torch.linspace(datamin, datamax, hist_points)
+
+      -- get the projections
+      local p0R = torch.histc(D0R[i], hist_points, datamin, datamax)
+      local p1R = torch.histc(D1R[i], hist_points, datamin, datamax)
+
+      -- get the transport map
+      local f = pdf_transfer1D_mean_weighted(p0R, p1R)
+
+      -- apply the mapping
+      D0R_[i] = (lin_interp_r(u, f, D0R[i]) - 1) / (hist_points - 1) * (datamax - datamin) + datamin
+    end
+
+    D0:add(torch.inverse(R):t() * (D0R_ - D0R) * relaxation)  -- D0 = relaxation * (R \ (D0R_ - D0R)) + D0;
+  end
+
+  return D0
+end
+
+
 local function reshape_histogram(channel_s, channel_d, hist_points)
 -- Scales destination histogram by shape of source histogram.
 -- Inspired by https://github.com/frcs/colour-transfer
@@ -256,11 +339,11 @@ local function reshape_histogram(channel_s, channel_d, hist_points)
 
   -- Making histograms
   local range_min_s, range_max_s = channel_s:min(), channel_s:max()   -- source range
-  local hist_points_s = torch.range(0, (hist_points - 1)) / (hist_points - 1) * (range_max_s - range_min_s) + range_min_s
+  local hist_points_s = torch.linspace(range_min_s, range_max_s, hist_points)
   local hist_s = torch.histc(channel_s, hist_points, range_min_s, range_max_s)   -- number of values within points' ranges
 
   local range_min_d, range_max_d = channel_d:min(), channel_d:max()
-  local hist_points_d = torch.range(0, (hist_points - 1)) / (hist_points - 1) * (range_max_d - range_min_d) + range_min_d
+  local hist_points_d = torch.linspace(range_min_d, range_max_d, hist_points)
   local hist_d = torch.histc(channel_d, hist_points, range_min_d, range_max_d)
 
   -- Normalizing histograms
@@ -293,6 +376,8 @@ function match_color(target_img, source_img, mode, eps)
   -- using a linear transform.
   -- Images are expected to be of form (c,h,w) and float in [0,1].
   -- Modes are chol, pca, sym / mkl, rgb, xyz, lab, lms, hsl, hsl-polar, labrgb, cholMpca, cholMsym, exp1.
+
+--  if target_img:equal(source_img) then return target_img end
   mode = mode or 'hsl-polar'
   eps = eps or 1e-5
 
@@ -741,6 +826,24 @@ function match_color(target_img, source_img, mode, eps)
 
     print('Probability density function transfer.')
     return pdf_transfer(D0, D1, R, params.recolor_strength):viewAs(target_img)
+  elseif mode == 'idt-mean' then
+    -- Direct reimplementation in Torch of https://github.com/frcs/colour-transfer, (c) F. Pitie 2007.
+    -- Modified (can Torch divide 2 non-square matrices?), but seems to work.
+    -- With "mean-weighted" linear interpolation function.
+
+    local nb_iterations = 10 -- calculation time is proportional
+
+    local D0 = target_img:view(target_img:size(1), target_img[1]:nElement())
+    local D1 = source_img:view(source_img:size(1), source_img[1]:nElement())
+
+    print('Building a sequence of (almost) random projections.')
+    local R = torch.Tensor(3, 3)
+    R = torch.Tensor({{ 1.0,  0.0,  0.0},
+                      { 0.0,  1.0,  0.0},
+                      { 0.0,  0.0,  1.0}})
+
+    print('Probability density function transfer (mean-weighted).')
+    return pdf_transfer_mean_weighted(D0, D1, R, nb_iterations, params.recolor_strength):viewAs(target_img)
   elseif mode == 'rgb-hist' then
     -- Weighted by histogram scaling of RGB channels.
     -- Inspired by https://github.com/frcs/colour-transfer
