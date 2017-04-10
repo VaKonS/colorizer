@@ -22,7 +22,7 @@ cmd:option('-prefer_torch', false,
 cmd:text()
 
 local params = cmd:parse(arg)
-local Torch_MultiCore = params.prefer_torch or torch.getnumcores() > 1
+local prefer_Torch = params.prefer_torch or torch.getnumcores() > 1
 
 
 local function main(params)
@@ -62,20 +62,87 @@ local function haveNaNs(t)  -- Checks that tensor contains NaN values.
 end
 
 
+-- Sorting v and x tensors by order of x, removing duplicates and NaNs.
+local function clean_arrays_xv(x, v)
+  -- Removing NaNs.
+  local is_number = torch.abs(x):ge(0)
+  local x, v = x[is_number], v[is_number]
+  is_number = torch.abs(v):ge(0)
+  x, v = x[is_number], v[is_number]
+
+  -- Sorting
+  local xnc
+  x, xnc = torch.sort(x)
+  v = v:index(1, xnc)
+
+  -- Cleaning duplicates
+  local xs1 = x:size(1)
+  local px, n = math.sqrt(-1), torch.LongTensor(xs1)
+--[[ -- Keep 1st duplicate x.
+  local ix = 1
+  for i = 1, xs1 do
+    local xc = x[i]
+    if xc ~= px then
+      n[ix] = i
+      ix = ix + 1
+      px = xc
+    end
+  end
+  n = n[{{1, ix - 1}}]
+  x, v = x:index(1, n), v:index(1, n)
+--]]
+--[[ -- Keep last duplicate x.
+  local ix = 0
+  for i = 1, xs1 do
+    local xc = x[i]
+    if xc ~= px then
+      ix = ix + 1
+      px = xc
+    end
+    n[ix] = i
+  end
+  n = n[{{1, ix}}]
+  x, v = x:index(1, n), v:index(1, n)
+--]]
+-- --[[ -- Average Vs, corresponding to same Xs.
+  local ix, ax, va = 0, 0, torch.Tensor(xs1)
+  for i = 1, xs1 do
+    local xc = x[i]
+    if xc ~= px then
+      ix = ix + 1
+      px = xc
+      ax = 1
+      n[ix] = i
+      va[ix] = v[i]
+    else
+      ax = ax + 1
+      va[ix] = (va[ix] * (ax - 1) + v[i]) / ax
+    end
+  end
+  x, v = x:index(1, n[{{1, ix}}]), va[{{1, ix}}]
+--]]
+
+  return x, v
+end
+
+
 -- NaNs are zeroed in resulting tensor.
 local function lin_interp(x, v, xq)
 -- http://www.mathworks.com/help/matlab/ref/interp1.html
-  if x:size(1) == 1 then  -- only 1 point, vq = xq/x*v
-    return torch.mul(xq, v[1]):div(x[1])
+  local xqs1 = xq:size(1)
+  if x:size(1) == 1 then  -- only 1 point, nothing to extrapolate
+    if math.abs(v[1]) >= 0 then
+      return torch.Tensor(xqs1):fill(v[1]) -- point-weighted, assuming v[n] = v[1]
+--    return torch.mul(xq, v[1]):div(x[1]) -- zero-weighted, vq = [xq-0]/[x-0]*[v-0]
+    else
+      return torch.Tensor(xqs1):fill(0)
+    end
   else
-    -- Removing NaNs from X / V
-    local x_is_number = torch.abs(x):ge(0)
-    local x, xnc = torch.sort(x[x_is_number])
-    local v = v[x_is_number]:index(1, xnc)
-    local xs1, xqs1 = x:size(1), xq:size(1)
+    local x, v = clean_arrays_xv(x, v)
+    local xs1 = x:size(1)
 
     local s, a, vq = torch.Tensor(xs1), torch.Tensor(xs1), torch.zeros(xqs1) -- to not generate NaNs accidentally.
-    local x_min, x_max = x:min(), x:max()
+    local x_min, x_max = x[1], x[-1]
     local x_bin = (x_max - x_min) / (xs1 - 1)
     s[{{1, -2}}] = (v[{{2, -1}}] - v[{{1, -2}}]):cdiv(x[{{2, -1}}] - x[{{1, -2}}])
     a[{{1, -2}}] = torch.addcmul(v[{{1, -2}}], -x[{{1, -2}}], s[{{1, -2}}])
@@ -94,16 +161,16 @@ local function lin_interp(x, v, xq)
     end
     x_search[{{fMin, -1}}]:fill(xs1)
 
-    if Torch_MultiCore == true then -- Torch parallel calculations should be faster in multicore environment.
+    if prefer_Torch == true then -- Torch parallel calculations should be faster in multicore environment.
       local xi = (xq - x_min):div(x_bin):floor():long():add(1)  -- Equally-spaced index
       local xq_numeric = torch.abs(xq):ge(0)  -- Numeric values flag
       for xqi = 1, xqs1 do
         local c = xq[xqi]
-        if c <= x_min then          -- extrapolate below
+        if c <= x_min then               -- extrapolate below
           vq[xqi] = c * s1 + a1
-        elseif c >= x_max then      -- extrapolate above
+        elseif c >= x_max then           -- extrapolate above
           vq[xqi] = c * sL + aL
-        elseif xq_numeric[xqi] then -- interpolate, NaNs are ignored
+        elseif xq_numeric[xqi] == 1 then -- interpolate, NaNs are ignored
           for i = x_search[xi[xqi]], 1, -1 do
             if c >= x[i] then
               vq[xqi] = c * s[i] + a[i]
@@ -128,7 +195,68 @@ local function lin_interp(x, v, xq)
           end
         end
       end
-    end   -- Single/MultiCore
+    end   -- Single/multicore
+    return vq
+  end
+end
+
+
+-- Faster variant, mean-weighted interpolation.
+local function lin_interp_mean(x, v, xq)
+-- http://www.mathworks.com/help/matlab/ref/interp1.html
+  local xqs1 = xq:size(1)
+  if x:size(1) == 1 then
+    if math.abs(v[1]) >= 0 then
+      return torch.Tensor(xqs1):fill(v[1])
+    else
+      return torch.Tensor(xqs1):fill(0)
+    end
+  else
+    -- Removing NaNs.
+    local is_number = torch.abs(x):ge(0)
+    local x, v = x[is_number], v[is_number]
+    is_number = torch.abs(v):ge(0)
+    x, v = x[is_number], v[is_number]
+    local xs1 = x:size(1)
+
+    local s, a, vq = torch.Tensor(xs1), torch.Tensor(xs1), torch.zeros(xqs1)
+    local x_min, x_max = x:min(), x:max()
+    local x_bin = (x_max - x_min) / (xs1 - 1)
+
+    s[{{1, -2}}] = (v[{{2, -1}}] - v[{{1, -2}}]):div(x_bin)
+    a[{{1, -2}}] = torch.addcmul(v[{{1, -2}}], -x[{{1, -2}}], s[{{1, -2}}])
+
+    local s1, sL = s[1], s[-2]
+    local a1, aL = a[1], v[-1] - x_max * sL
+    s[-1], a[-1] = sL, aL
+
+    if prefer_Torch == true then -- Torch parallel calculations should be faster in multicore environment.
+      local xi = (xq - x_min):div(x_bin):floor():long():add(1)
+      local xq_numeric = torch.abs(xq):ge(0)  -- Numeric values flag
+      for xqi = 1, xqs1 do
+        local c = xq[xqi]
+        if c <= x_min then               -- extrapolate below
+          vq[xqi] = c * s1 + a1
+        elseif c >= x_max then           -- extrapolate above
+          vq[xqi] = c * sL + aL
+        elseif xq_numeric[xqi] == 1 then -- interpolate, NaNs are ignored
+          local i = xi[xqi]
+          vq[xqi] = c * s[i] + a[i]
+        end
+      end
+    else -- Lua variant should be faster on single core, because calculations are partially skipped, depending on images.
+      for xqi = 1, xqs1 do
+        local c = xq[xqi]
+        if c <= x_min then           -- extrapolate below
+          vq[xqi] = c * s1 + a1
+        elseif c >= x_max then       -- extrapolate above
+          vq[xqi] = c * sL + aL
+        elseif math.abs(c) >= 0 then -- interpolate, NaNs are ignored
+          local i = math.floor((c - x_min) / x_bin) + 1
+          vq[xqi] = c * s[i] + a[i]
+        end
+      end
+    end   -- Single/multicore
     return vq
   end
 end
@@ -137,13 +265,12 @@ end
 -- Faster variant for tensors without NaNs and sorted and equally spaced X.
 local function lin_interp_r(x, v, xq)
 -- http://www.mathworks.com/help/matlab/ref/interp1.html
-  local xs1 = x:size(1)
-  if xs1 == 1 then  -- only 1 point, vq = xq/x*v
-    return torch.mul(xq, v[1]):div(x[1])
+  local xs1, xqs1 = x:size(1), xq:size(1)
+  if xs1 == 1 then
+    return torch.Tensor(xqs1):fill(v[1])
   else
-    local xqs1 = xq:size(1)
     local s, a, vq = torch.Tensor(xs1), torch.Tensor(xs1), torch.Tensor(xqs1)
-    local x_min, x_max = x:min(), x:max()
+    local x_min, x_max = x[1], x[-1]
     local x_bin = (x_max - x_min) / (xs1 - 1)
     s[{{1, -2}}] = (v[{{2, -1}}] - v[{{1, -2}}]):div(x_bin)
     a[{{1, -2}}] = torch.addcmul(v[{{1, -2}}], -x[{{1, -2}}], s[{{1, -2}}])
@@ -152,7 +279,7 @@ local function lin_interp_r(x, v, xq)
     local a1, aL = a[1], v[-1] - x_max * sL
     s[-1], a[-1] = sL, aL
 
-    if Torch_MultiCore == true then -- Torch parallel calculations should be faster in multicore environment.
+    if prefer_Torch == true then -- Torch parallel calculations should be faster in multicore environment.
       local xi = (xq - x_min):div(x_bin):floor():long():add(1)
       for xqi = 1, xqs1 do
         local c = xq[xqi]
@@ -177,7 +304,7 @@ local function lin_interp_r(x, v, xq)
           vq[xqi] = c * s[i] + a[i]
         end
       end
-    end   -- Single/MultiCore
+    end   -- Single/multicore
     return vq
   end
 end
@@ -278,7 +405,7 @@ local function pdf_transfer1D_mean_weighted(pX,pY)
   PY = torch.div(PY, PY[-1])
 
   -- inversion
-  local f = lin_interp_r(PY, torch.range(0, nbins - 1), PX)
+  local f = lin_interp_mean(PY, torch.range(0, nbins - 1), PX)
   f[torch.le(PX, PY[1])] = 0
   f[torch.ge(PX, PY[-1])] = nbins - 1
 
@@ -324,7 +451,7 @@ local function pdf_transfer_mean_weighted(D0, D1, R, nb_iterations, varargin)
       local f = pdf_transfer1D_mean_weighted(p0R, p1R)
 
       -- apply the mapping
-      D0R_[i] = (lin_interp_r(u, f, D0R[i]) - 1) / (hist_points - 1) * (datamax - datamin) + datamin
+      D0R_[i] = (lin_interp_mean(u, f, D0R[i]) - 1) / (hist_points - 1) * (datamax - datamin) + datamin
     end
 
     D0:add(torch.inverse(R):t() * (D0R_ - D0R) * relaxation)  -- D0 = relaxation * (R \ (D0R_ - D0R)) + D0;
@@ -838,7 +965,6 @@ function match_color(target_img, source_img, mode, eps)
     local D0 = target_img:view(target_img:size(1), target_img[1]:nElement())
     local D1 = source_img:view(source_img:size(1), source_img[1]:nElement())
 
-    print('Building a sequence of (almost) random projections.')
     local R = torch.Tensor(3, 3)
     R = torch.Tensor({{ 1.0,  0.0,  0.0},
                       { 0.0,  1.0,  0.0},
