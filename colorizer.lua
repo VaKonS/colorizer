@@ -78,7 +78,7 @@ local function clean_arrays_xv(x, v)
   -- Cleaning duplicates
   local xs1 = x:size(1)
   local px, n = math.sqrt(-1), torch.LongTensor(xs1)
---[[ -- Keep 1st duplicate x.
+--[[ -- Keep v, corresponding to 1st duplicate x.
   local ix = 1
   for i = 1, xs1 do
     local xc = x[i]
@@ -91,7 +91,7 @@ local function clean_arrays_xv(x, v)
   n = n[{{1, ix - 1}}]
   x, v = x:index(1, n), v:index(1, n)
 --]]
---[[ -- Keep last duplicate x.
+--[[ -- Keep v, corresponding to last duplicate x.
   local ix = 0
   for i = 1, xs1 do
     local xc = x[i]
@@ -132,8 +132,8 @@ local function lin_interp(x, v, xq)
   local xqs1 = xq:size(1)
   if x:size(1) == 1 then  -- only 1 point, nothing to extrapolate
     if math.abs(v[1]) >= 0 then
-      return torch.Tensor(xqs1):fill(v[1]) -- point-weighted, assuming v[n] = v[1]
---    return torch.mul(xq, v[1]):div(x[1]) -- zero-weighted, vq = [xq-0]/[x-0]*[v-0]
+      return torch.Tensor(xqs1):fill(v[1]) -- point-weighted, assuming vq[n] = v[1]
+--    return torch.mul(xq, (v[1] / x[1]))  -- zero-weighted, vq[n] = (xq[n]-0) * ((v[1]-0)/(x[1]-0))
     else
       return torch.Tensor(xqs1):fill(0)
     end
