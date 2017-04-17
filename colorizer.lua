@@ -950,7 +950,11 @@ function match_color(target_img, source_img, mode, eps)
 --                       { 2/3, -1/3,  2/3},
 --                       {-1/3,  2/3,  2/3}})
     for i = 2, nb_iterations do
-      R[i]   = R[1] * ml_orth(torch.rand(3, 3))
+--      R[i] = R[1]
+      local Rt = torch.rand(3, 3):abs()
+      Rt = (Rt * Rt:t()):sqrt()
+      Rt[torch.diag(torch.ones(3)):byte()] = -Rt
+      R[i] = R[1] * ml_orth(Rt)
     end
 
     print('Probability density function transfer.')
