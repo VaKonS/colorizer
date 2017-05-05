@@ -385,7 +385,7 @@ local function pdf_transfer(D0, D1, Rotations, varargin)
       D0R_[i] = (lin_interp(u, f, D0R[i])-1) / (hist_points - 1) * (datamax-datamin) + datamin
     end
 
-    D0:add(torch.inverse(R):t() * (D0R_ - D0R) * relaxation)  -- D0 = relaxation * (R \ (D0R_ - D0R)) + D0;
+    D0:add(torch.inverse(R) * (D0R_ - D0R) * relaxation)  -- D0 = relaxation * (R \ (D0R_ - D0R)) + D0;
   end
 
   return D0
@@ -454,7 +454,7 @@ local function pdf_transfer_mean_weighted(D0, D1, R, nb_iterations, varargin)
       D0R_[i] = (lin_interp_mean(u, f, D0R[i]) - 1) / (hist_points - 1) * (datamax - datamin) + datamin
     end
 
-    D0:add(torch.inverse(R):t() * (D0R_ - D0R) * relaxation)  -- D0 = relaxation * (R \ (D0R_ - D0R)) + D0;
+    D0:add(torch.inverse(R) * (D0R_ - D0R) * relaxation)  -- D0 = relaxation * (R \ (D0R_ - D0R)) + D0;
   end
 
   return D0
